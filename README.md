@@ -1,5 +1,5 @@
 # epimetheus
-Tool to scrape prometheus metrics and execute some queries for debug/troubleshooting purposes
+Tool to scrape prometheus metrics and execute some queries for debug/troubleshooting/CI purposes
 
 # usage
 
