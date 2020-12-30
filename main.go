@@ -12,7 +12,7 @@ import (
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/prometheus/pkg/labels"
-	promqlParser "github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/teststorage"
 )
@@ -26,15 +26,6 @@ func main() {
 
 	if url == "" {
 		log.Fatal("You must provide an URL")
-	}
-
-	var parsedExpr promqlParser.Expr
-	var err error
-	if expr != "" {
-		parsedExpr, err = promqlParser.ParseExpr(expr)
-		if err != nil {
-			log.Fatalf("Could not parse expr: %s, err=%s", expr, err.Error())
-		}
 	}
 
 	resp, err := http.Get(url)
@@ -51,20 +42,39 @@ func main() {
 		log.Fatalf("Could not decode prometheus metrics: err=%s", err.Error())
 	}
 	storage := teststorage.New(&log.Logger{})
+	defer storage.Close()
 	err = ingestMetrics(storage, metricsFamilies)
 	if err != nil {
 		log.Fatalf("Could not ingest prometheus metrics: err=%s", err.Error())
 	}
-	if parsedExpr == nil {
-		fmt.Println("TODO execute expr")
+
+	engine := promql.NewEngine(promql.EngineOpts{
+		//Reg: storage,
+		LookbackDelta: time.Minute * 5,
+		Timeout:       time.Second * 10,
+	})
+	query, err := engine.NewInstantQuery(storage, expr, time.Now())
+	if err != nil {
+		log.Fatalf("Could not create query: err=%s", err.Error())
 	}
+	result := query.Exec(context.Background())
+	if result.Err != nil {
+		log.Fatalf("Could not execute query: err=%s", result.Err.Error())
+	}
+
+	fmt.Println("type of result", result.Value.Type())
+	vector, err := result.Vector()
+	if err != nil {
+		log.Fatalf("Could not create vector: err=%s", err.Error())
+	}
+
+	fmt.Println("lenvector", len(vector))
 
 }
 
 func ingestMetrics(st storage.Storage, metricsFamilies []*io_prometheus_client.MetricFamily) error {
 	appender := st.Appender(context.Background())
 
-	defer appender.Commit()
 	now := time.Now()
 	for _, mf := range metricsFamilies {
 		for _, m := range mf.Metric {
@@ -101,7 +111,8 @@ func ingestMetrics(st storage.Storage, metricsFamilies []*io_prometheus_client.M
 			}
 		}
 	}
-	return nil
+
+	return appender.Commit()
 }
 
 func decodeMetrics(r io.Reader) ([]*io_prometheus_client.MetricFamily, error) {
