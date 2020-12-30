@@ -12,6 +12,7 @@ import (
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/teststorage"
@@ -20,70 +21,80 @@ import (
 func main() {
 	var url string
 	var expr string
+	var interval int
 	flag.StringVar(&url, "url", "", "URL to scrape")
 	flag.StringVar(&expr, "expr", "", "Expr to evaluate")
+	flag.IntVar(&interval, "interval", 5, "scrape metrics every interval")
 	flag.Parse()
 
 	if url == "" {
 		log.Fatal("You must provide an URL")
 	}
 
-	resp, err := http.Get(url)
-	if err != nil {
-		log.Fatalf("Could not get URL: %s, err=%s", url, err.Error())
-	}
-	if resp.StatusCode >= http.StatusBadRequest {
-		log.Fatalf("Could not get URL: %s, statusCode=%d", url, resp.StatusCode)
-	}
-	defer resp.Body.Close()
-
-	metricsFamilies, err := decodeMetrics(resp.Body)
-	if err != nil {
-		log.Fatalf("Could not decode prometheus metrics: err=%s", err.Error())
-	}
 	storage := teststorage.New(&log.Logger{})
 	defer storage.Close()
-	err = ingestMetrics(storage, metricsFamilies)
+
+	for {
+		reader, err := readerForURL(url)
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+		metricsFamilies, err := decodeMetrics(reader)
+		if err != nil {
+			log.Fatalf("Could not decode prometheus metrics: err=%s", err.Error())
+		}
+		reader.Close()
+
+		err = ingestMetrics(storage, metricsFamilies)
+		if err != nil {
+			log.Fatalf("Could not ingest prometheus metrics: err=%s", err.Error())
+		}
+
+		engine := promql.NewEngine(promql.EngineOpts{
+			MaxSamples:    10000,
+			LookbackDelta: time.Minute * 5,
+			Timeout:       time.Second * 10,
+		})
+		query, err := engine.NewInstantQuery(storage, expr, timestamp.Time(time.Now().Unix()))
+		if err != nil {
+			log.Fatalf("Could not create query: err=%s", err.Error())
+		}
+		result := query.Exec(context.Background())
+		if result.Err != nil {
+			log.Fatalf("Could not execute query: err=%s", result.Err.Error())
+		}
+
+		switch v := result.Value.(type) {
+		case promql.Vector:
+			for _, item := range v {
+				fmt.Println(item.Metric, item.Point.V)
+			}
+		}
+
+		time.Sleep(time.Second * time.Duration(interval))
+	}
+}
+
+func readerForURL(url string) (io.ReadCloser, error) {
+	resp, err := http.Get(url)
 	if err != nil {
-		log.Fatalf("Could not ingest prometheus metrics: err=%s", err.Error())
+		return nil, fmt.Errorf("Could not get URL: %s, err=%s", url, err.Error())
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		resp.Body.Close()
+		return nil, fmt.Errorf("Could not get URL: %s, statusCode=%d", url, resp.StatusCode)
 	}
 
-	engine := promql.NewEngine(promql.EngineOpts{
-		//Reg: storage,
-		LookbackDelta: time.Minute * 5,
-		Timeout:       time.Second * 10,
-	})
-	query, err := engine.NewInstantQuery(storage, expr, time.Now())
-	if err != nil {
-		log.Fatalf("Could not create query: err=%s", err.Error())
-	}
-	result := query.Exec(context.Background())
-	if result.Err != nil {
-		log.Fatalf("Could not execute query: err=%s", result.Err.Error())
-	}
-
-	fmt.Println("type of result", result.Value.Type())
-	vector, err := result.Vector()
-	if err != nil {
-		log.Fatalf("Could not create vector: err=%s", err.Error())
-	}
-
-	fmt.Println("lenvector", len(vector))
-
+	return resp.Body, nil
 }
 
 func ingestMetrics(st storage.Storage, metricsFamilies []*io_prometheus_client.MetricFamily) error {
 	appender := st.Appender(context.Background())
 
-	now := time.Now()
+	now := time.Now().Round(time.Second)
 	for _, mf := range metricsFamilies {
 		for _, m := range mf.Metric {
-			metricLabels := labels.Labels{
-				{
-					Name:  "__name__",
-					Value: mf.GetName(),
-				},
-			}
+			metricLabels := labels.FromStrings(labels.MetricName, mf.GetName())
 			for _, label := range m.Label {
 				metricLabels = append(metricLabels, labels.Label{
 					Name:  label.GetName(),
@@ -111,7 +122,6 @@ func ingestMetrics(st storage.Storage, metricsFamilies []*io_prometheus_client.M
 			}
 		}
 	}
-
 	return appender.Commit()
 }
 
